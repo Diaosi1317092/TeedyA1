@@ -81,10 +81,12 @@ public class UserResource extends BaseResource {
         @FormParam("password") String password,
         @FormParam("email") String email,
         @FormParam("storage_quota") String storageQuotaStr) {
-        if (!authenticate()) {
-            throw new ForbiddenClientException();
-        }
-        checkBaseFunction(BaseFunction.ADMIN);
+        // if (!authenticate()) {
+        //     throw new ForbiddenClientException();
+        // }
+        // checkBaseFunction(BaseFunction.ADMIN);
+
+        System.out.println("YES");
         
         // Validate the input data
         username = ValidationUtil.validateLength(username, "username", 3, 50);
@@ -102,11 +104,12 @@ public class UserResource extends BaseResource {
         user.setEmail(email);
         user.setStorageQuota(storageQuota);
         user.setOnboarding(true);
+        user.setDisableDate(new Date());
 
         // Create the user
         UserDao userDao = new UserDao();
         try {
-            userDao.create(user, principal.getId());
+            userDao.create(user, null);
         } catch (Exception e) {
             if ("AlreadyExistingUsername".equals(e.getMessage())) {
                 throw new ClientException("AlreadyExistingUsername", "Login already used", e);

@@ -3,12 +3,13 @@
 /**
  * Login controller.
  */
-angular.module('docs').controller('Login', function(Restangular, $scope, $rootScope, $state, $stateParams, $dialog, User, $translate, $uibModal) {
+angular.module('docs').controller('Login', function(Restangular, $scope, $rootScope, $state, $stateParams, $dialog, User, $translate, $uibModal, $http, $httpParamSerializerJQLike) {
   $scope.codeRequired = false;
 
   // Get the app configuration
   Restangular.one('app').get().then(function(data) {
     $rootScope.app = data;
+    $rootScope.app.guest_login = true;
   });
 
   // Login as guest
@@ -19,6 +20,43 @@ angular.module('docs').controller('Login', function(Restangular, $scope, $rootSc
     };
     $scope.login();
   };
+
+  // Register
+  $scope.openRegister = function () {
+    $uibModal.open({
+      templateUrl: 'partial/docs/register.html',
+      controller : 'ModalRegister'
+    }).result.then(function (newUser) {
+      if (!newUser) return;
+
+      // 序列化表单
+      var body = $httpParamSerializerJQLike({
+        username      : newUser.username,
+        password      : newUser.password,
+        email         : newUser.email,
+        storage_quota : '0'
+      });
+
+      // 使用 Restangular.customPUT，自动加上 baseUrl (/teedy/api) 前缀
+      Restangular.one('user')
+        .withHttpConfig({ headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+        .customPUT(body, '', {}, {})  // body, pathSuffix = '', queryParams = {}, headers = {}
+        .then(function () {
+          var title = $translate.instant('register.success_title');
+          var msg   = $translate.instant('register.success_message');
+          var btns  = [{ result: 'ok', label: $translate.instant('ok'), cssClass: 'btn-primary' }];
+          $dialog.messageBox(title, msg, btns);
+        }, function (err) {
+          var title = $translate.instant('register.error_title');
+          var msg   = (err.data && err.data.message)
+                      ? err.data.message
+                      : $translate.instant('register.error_message');
+          var btns  = [{ result: 'ok', label: $translate.instant('ok'), cssClass: 'btn-primary' }];
+          $dialog.messageBox(title, msg, btns);
+        });
+    });
+  };
+
   
   // Login
   $scope.login = function() {

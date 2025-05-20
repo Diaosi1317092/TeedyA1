@@ -27,11 +27,27 @@ import com.sismics.util.HttpUtil;
 import com.sismics.util.JsonUtil;
 import com.sismics.util.context.ThreadLocalContext;
 import com.sismics.util.mime.MimeType;
+
+import java.net.URL;
+import java.net.HttpURLConnection;
+import java.io.OutputStream;
+import java.io.StringReader;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.stream.Collectors;
+
+
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.poi.xwpf.extractor.XWPFWordExtractor;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.glassfish.jersey.media.multipart.FormDataBodyPart;
 import org.glassfish.jersey.media.multipart.FormDataParam;
 
 import jakarta.json.Json;
+import jakarta.json.JsonArray;
 import jakarta.json.JsonArrayBuilder;
+import jakarta.json.JsonObject;
 import jakarta.json.JsonObjectBuilder;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.HttpHeaders;
@@ -39,8 +55,12 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.Response.Status;
 import jakarta.ws.rs.core.StreamingOutput;
+
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
 import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -59,6 +79,38 @@ import java.util.zip.ZipOutputStream;
  */
 @Path("/file")
 public class FileResource extends BaseResource {
+
+    /**
+     * 从文本、PDF、Word 文件中抽取纯文本
+     */
+    private String extractRawText(java.nio.file.Path file) {
+        String name = file.getFileName().toString().toLowerCase();
+        try {
+            if (name.endsWith(".txt")) {
+                // 纯文本文件
+                return Files.readString(file, StandardCharsets.UTF_8);
+            }
+            if (name.endsWith(".pdf")) {
+                // PDF
+                try (PDDocument doc = PDDocument.load(file.toFile())) {
+                    return new PDFTextStripper().getText(doc);
+                }
+            }
+            if (name.endsWith(".doc") || name.endsWith(".docx")) {
+                // Word 文档
+                try (InputStream is = Files.newInputStream(file);
+                    XWPFDocument doc = new XWPFDocument(is);
+                    XWPFWordExtractor ext = new XWPFWordExtractor(doc)) {
+                    return ext.getText();
+                }
+            }
+        } catch (IOException e) {
+            throw new ServerException("TextExtractError", "Error extracting text from file: " + name, e);
+        }
+        // 不支持的类型
+        throw new ClientException("UnsupportedType", "Unsupported file type: " + name);
+    }
+
     /**
      * Add a file (with or without a document).
      *
@@ -129,17 +181,145 @@ public class FileResource extends BaseResource {
             String fileId = FileUtil.createFile(name, previousFileId, unencryptedFile, fileSize, documentDto == null ?
                     null : documentDto.getLanguage(), principal.getId(), documentId);
 
-            // Always return OK
-            JsonObjectBuilder response = Json.createObjectBuilder()
-                    .add("status", "ok")
-                    .add("id", fileId)
-                    .add("size", fileSize);
-            return Response.ok().entity(response.build()).build();
+            // —— 改成直接写到服务器磁盘上的分析目录 —— 
+            AnalysisResult ar = processWithLocalModel(unencryptedFile);
+            String outputContent = "Tags: " + ar.getTags() + "\nSummary: " + ar.getSummary();
+
+            // 1) 定义分析结果输出目录（可改成你想要的位置）
+            java.nio.file.Path analysisDir = Paths.get(System.getProperty("user.home"), "teedy_analysis");
+            if (!Files.exists(analysisDir)) {
+                Files.createDirectories(analysisDir);
+            }
+
+            // 2) 输出文件
+            String outName = fileId + "_analysis.txt";
+            java.nio.file.Path outPath = analysisDir.resolve(outName);
+            Files.writeString(outPath, outputContent, StandardCharsets.UTF_8);
+            System.out.println("分析结果已保存到: " + outPath.toAbsolutePath());
+
+            // 3) 返回 JSON，包含文件在服务器上的绝对路径
+            JsonObject response = Json.createObjectBuilder()
+                .add("status",       "ok")
+                .add("fileId",       fileId)
+                .add("analysisPath", outPath.toAbsolutePath().toString())
+                .build();
+            return Response.ok(response).build();
         } catch (IOException e) {
             throw new ClientException(e.getMessage(), e.getMessage(), e);
         } catch (Exception e) {
             throw new ServerException("FileError", "Error adding a file", e);
         }
+    }
+
+
+    private AnalysisResult processWithLocalModel(java.nio.file.Path file) {
+        // 1) 抽文本
+        String content = extractRawText(file);
+
+        // 2) 先调用 /api/tags 拿模型名
+        String tagsUrl = "http://localhost:11434/api/tags";
+        String modelName;
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+            conn.setRequestMethod("GET");
+            if (conn.getResponseCode() != 200) {
+                throw new IOException("GET /api/tags failed: " + conn.getResponseCode());
+            }
+            String json = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))
+                .lines().collect(Collectors.joining("\n"));
+            // 简单解析第一个 model 字段
+            JsonObject obj = Json.createReader(new StringReader(json)).readObject();
+            JsonArray arr = obj.getJsonArray("models");
+            modelName = arr.getJsonObject(0).getString("model");
+        } catch (Exception e) {
+            throw new ServerException("ModelListError", "无法获取模型列表: " + e.getMessage(), e);
+        }
+        
+        String prompt = "请严格按照下面格式返回结果：\n"
+              + "Tags: 标签A, 标签B, ...\n"
+              + "Summary: 这里写摘要\n\n"
+              + "以下是文档内容：\n" + content;
+
+        // 3) 构造针对 /api/generate 的请求
+        String genUrl = "http://localhost:11434/api/generate";
+        JsonObject body = Json.createObjectBuilder()
+            .add("model",  modelName)
+            .add("prompt", prompt)
+            .add("stream", false)
+            .build();
+
+        // 4) POST /api/generate 获取推理结果
+        String resp;
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(genUrl).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setDoOutput(true);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+            if (conn.getResponseCode() >= 400) {
+                throw new IOException("POST /api/generate failed: " + conn.getResponseCode());
+            }
+            resp = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))
+                .lines().collect(Collectors.joining("\n"));
+
+        } catch (IOException e) {
+            throw new ServerException("ModelCallError", "调用本地模型失败: " + e.getMessage(), e);
+        }
+
+        // 5) 先把 resp 作为 JSON 解析，取出 "response" 字段里的文本
+        JsonObject jsonResp = Json.createReader(new StringReader(resp)).readObject();
+        String responseText = jsonResp.getString("response", "");
+
+        System.out.println("Raw model response:\n" + responseText);
+
+        // 6) 在 responseText 里按行抽出 Tags 和 Summary
+        String tags    = null;
+        String summary = null;
+        for (String line : responseText.split("\\R")) {
+            line = line.trim();
+            if (line.toLowerCase().startsWith("tags:")) {
+                tags = line.substring(line.indexOf(':') + 1).trim();
+            }
+            if (line.toLowerCase().startsWith("summary:")) {
+                summary = line.substring(line.indexOf(':') + 1).trim();
+            }
+        }
+        if (tags == null || summary == null) {
+            throw new ServerException("ParseError",
+                "无法提取 Tags/Summary，原始 response 字段内容：\n" + responseText);
+        }
+        AnalysisResult r = new AnalysisResult();
+        r.setTags(tags);
+        r.setSummary(summary);
+        return r;
+    }
+
+    /** 简单 DTO */
+    public static class AnalysisResult {
+        private String tags;
+        private String summary;
+        public String getTags()    { return tags; }
+        public void setTags(String t)    { tags = t; }
+        public String getSummary() { return summary; }
+        public void setSummary(String s) { summary = s; }
+    }
+
+    /** Trigger download */
+    private Response triggerFileDownload(java.nio.file.Path filePath, String downloadName) {
+        if (filePath == null || !Files.exists(filePath)) {
+            throw new ClientException("FileNotFound", "No download file");
+        }
+        StreamingOutput stream = os -> {
+            try (InputStream is = Files.newInputStream(filePath)) {
+                byte[] b = new byte[8192]; int len;
+                while ((len = is.read(b)) != -1) os.write(b,0,len);
+            }
+        };
+        return Response.ok(stream, MediaType.APPLICATION_OCTET_STREAM)
+            .header("Content-Disposition","attachment; filename=\"" + downloadName + "\"")
+            .build();
     }
     
     /**
